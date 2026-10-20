@@ -44,11 +44,6 @@ func TestPreview(t *testing.T) {
 		name string
 		app  *app
 	}{
-		{"home", &app{
-			face:    face,
-			view:    viewHome,
-			homeSel: 0,
-		}},
 		{"cache", &app{
 			face: face,
 			view: viewCache,
@@ -58,6 +53,10 @@ func TestPreview(t *testing.T) {
 			},
 			cacheSel:   1,
 			cacheFirst: 0,
+		}},
+		{"cache-empty", &app{
+			face: face,
+			view: viewCache,
 		}},
 		{"fetching", &app{
 			face: face,

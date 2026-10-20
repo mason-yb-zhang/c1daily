@@ -1,9 +1,14 @@
 // 读书网（dushu.com）每日美文抓取与解析。
-// 页面为 UTF-8 完整 HTML；站点偶发慢/超时，HTTP client 超时 30 秒、失败重试 1 次。
+// 页面为 UTF-8 完整 HTML；站点偶发慢（观测到 40s 无响应），HTTP client 超时 60 秒、
+// 失败重试 2 次（间隔 2s）。
+// 设备的 /etc/ssl/certs 为空（系统无 CA 根证书），故内嵌 Certum 根/中间证书自建 pool。
 package main
 
 import (
 	"crypto/sha1"
+	"crypto/tls"
+	"crypto/x509"
+	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -21,13 +26,61 @@ const (
 	dushuSourceToday  = "dushu-today"
 	dushuSourceRandom = "dushu-random"
 
-	dushuHTTPTimeout = 30 * time.Second
-	dushuRetries     = 1 // 失败后额外重试次数
-	dushuMaxBody     = 1 << 20
+	dushuHTTPTimeout  = 60 * time.Second
+	dushuRetries      = 2 // 失败后额外重试次数
+	dushuRetryBackoff = 2 * time.Second
+	dushuMaxBody      = 1 << 20
 )
 
-// dushuClient 站点较慢，超时放宽到 30 秒。
-var dushuClient = &http.Client{Timeout: dushuHTTPTimeout}
+//go:embed assets/tls/certum-trusted-root-ca.pem
+var certumRootPEM []byte
+
+//go:embed assets/tls/certum-dv-tls-g2-r39-ca.pem
+var certumIntermediatePEM []byte
+
+// dushuCertPool 内嵌 Certum 根证书 + 中间证书（服务端有发送，双保险）构建的
+// x509 pool。设备 /etc/ssl/certs 为空，x509.SystemCertPool 取不到根证书，
+// 因此必须先尝试系统 pool（失败或为空则新建），再追加两个 PEM。
+func dushuCertPool() (*x509.CertPool, error) {
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if len(pool.Subjects()) == 0 {
+		// 设备上 SystemCertPool 可能返回空 pool 而不报错，同样不能用。
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(certumRootPEM) {
+		return nil, fmt.Errorf("append certum root ca failed")
+	}
+	if !pool.AppendCertsFromPEM(certumIntermediatePEM) {
+		return nil, fmt.Errorf("append certum intermediate ca failed")
+	}
+	return pool, nil
+}
+
+// dushuTLSConfig 设备实测：Go 默认 TLS 1.3（含后量子 X25519Kyber768 密钥协商，
+// ClientHello 很大）会让握手在设备网络路径上停滞直到超时（curl TLS 1.2 正常）。
+// 强制 TLS 1.2 规避；RootCAs 用内嵌 Certum pool（设备系统无 CA 根证书）。
+var dushuTLSConfig = &tls.Config{
+	RootCAs:    mustDushuCertPool(),
+	MaxVersion: tls.VersionTLS12,
+}
+
+// dushuClient 站点较慢，超时放宽到 60 秒。
+var dushuClient = &http.Client{
+	Timeout:   dushuHTTPTimeout,
+	Transport: &http.Transport{TLSClientConfig: dushuTLSConfig},
+}
+
+func mustDushuCertPool() *x509.CertPool {
+	pool, err := dushuCertPool()
+	if err != nil {
+		// 内嵌 PEM 是编译期资产，构建失败只能是编码错误；panic 留痕比带病运行好。
+		panic(fmt.Sprintf("c1daily: build cert pool: %v", err))
+	}
+	return pool
+}
 
 // FetchToday 抓取今日美文（/meiwen/）。
 func FetchToday() (*Article, error) {
@@ -39,10 +92,13 @@ func FetchRandom() (*Article, error) {
 	return fetchDushu(dushuRandomURL, dushuSourceRandom)
 }
 
-// fetchDushu 抓取并解析文章；失败重试 dushuRetries 次。
+// fetchDushu 抓取并解析文章；失败重试 dushuRetries 次（间隔 dushuRetryBackoff）。
 func fetchDushu(url, source string) (*Article, error) {
 	var lastErr error
 	for attempt := 0; attempt <= dushuRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(dushuRetryBackoff)
+		}
 		body, err := dushuGet(url)
 		if err != nil {
 			lastErr = err

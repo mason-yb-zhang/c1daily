@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"testing"
 	"time"
@@ -117,4 +120,70 @@ func TestFetchLive(t *testing.T) {
 
 func liveEnabled() bool {
 	return os.Getenv("C1DAILY_LIVE_TEST") == "1"
+}
+
+// TestDushuCertPool 内嵌 PEM 都能加入 pool，且 pool 非空。
+func TestDushuCertPool(t *testing.T) {
+	pool, err := dushuCertPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pool == nil {
+		t.Fatal("pool is nil")
+	}
+	if len(pool.Subjects()) == 0 {
+		t.Fatal("pool has no subjects")
+	}
+	// 两个 PEM 各自单独 append 也应成功
+	for name, pem := range map[string][]byte{
+		"root":         certumRootPEM,
+		"intermediate": certumIntermediatePEM,
+	} {
+		p := x509.NewCertPool()
+		if !p.AppendCertsFromPEM(pem) {
+			t.Fatalf("append %s pem failed", name)
+		}
+	}
+}
+
+// TestDushuTLSConfig TLS 1.2 上限 + 内嵌证书池（设备上 TLS 1.3 握手会停滞）。
+func TestDushuTLSConfig(t *testing.T) {
+	if dushuTLSConfig.RootCAs == nil {
+		t.Fatal("RootCAs is nil")
+	}
+	if dushuTLSConfig.MaxVersion != tls.VersionTLS12 {
+		t.Fatalf("MaxVersion = %x, want TLS1.2", dushuTLSConfig.MaxVersion)
+	}
+}
+
+// TestDushuLeafVerifies 用内嵌根+中间证书验证真实站点 leaf（DNSName www.dushu.com）。
+func TestDushuLeafVerifies(t *testing.T) {
+	leafPEM, err := os.ReadFile("testdata/dushu-leaf.pem")
+	if err != nil {
+		t.Skip("leaf fixture missing:", err)
+	}
+	block, _ := pem.Decode(leafPEM)
+	if block == nil {
+		t.Fatal("leaf pem not decoded")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certumRootPEM) {
+		t.Fatal("append root failed")
+	}
+	intermediates := x509.NewCertPool()
+	if !intermediates.AppendCertsFromPEM(certumIntermediatePEM) {
+		t.Fatal("append intermediate failed")
+	}
+	opts := x509.VerifyOptions{
+		DNSName:       "www.dushu.com",
+		Roots:         roots,
+		Intermediates: intermediates,
+	}
+	if _, err := leaf.Verify(opts); err != nil {
+		t.Fatalf("leaf verify failed: %v", err)
+	}
 }

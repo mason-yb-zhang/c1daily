@@ -1,5 +1,6 @@
 // 每日一读 — C1-Slim 墨水屏每日美文客户端。
-// 首页三段（今日一读 / 随机一篇 / 缓存列表）+ 阅读器 + 设置。
+// 启动即读今日文章（有缓存秒开，否则联网抓取）；阅读器 R 随机一篇，
+// Back 进缓存列表，再 Back 退出应用。
 // UI/渲染/字体/分页栈移植自 c1weread / reader-lab。
 package main
 
@@ -44,9 +45,6 @@ type app struct {
 	errMsg  string
 	message string // 阅读器/设置等临时提示
 
-	homeSel   int
-	homeFirst int
-
 	cacheEntries []indexEntry
 	cacheSel     int
 	cacheFirst   int
@@ -63,8 +61,6 @@ type app struct {
 	fetchDone   chan fetchResult // 后台抓取完成信号（nil = 空闲）
 	retryKind   fetchKind        // 错误屏 OK 重试时重新发起的抓取类型
 	fetchCancel bool             // 抓取已被 Back 取消，结果到来时忽略
-	errReturn   viewMode         // 错误屏 Back 退回到的视图
-	backView    viewMode         // 阅读器 Back 退回到的视图（首页或缓存列表）
 }
 
 // writeTrace 向数据目录的 c1daily.trace 追加一行（崩溃/信号诊断用，与启动器日志无关）。
@@ -137,14 +133,16 @@ func main() {
 	}
 
 	a := &app{
-		face:      face,
-		bodyFace:  bodyFace,
-		fontData:  fontData,
-		settings:  settings,
-		view:      viewHome,
-		backView:  viewHome,
-		errReturn: viewHome,
+		face:     face,
+		bodyFace: bodyFace,
+		fontData: fontData,
+		settings: settings,
+		view:     viewCache,
 	}
+
+	// 启动即读：有今日缓存秒开，否则联网抓取（抓取中视图可 Back 取消）。
+	a.refreshCacheEntries()
+	a.openToday()
 
 	platform, err := c1device.OpenPlatform()
 	if err != nil {
@@ -186,14 +184,14 @@ func main() {
 			}
 			if res.err != nil {
 				a.retryKind = res.kind
-				a.errReturn = a.backView
-				a.fail(fmt.Sprintf("抓取失败: %v\n\nOK 重试，←/Back 返回", res.err))
+				writeTrace("fetch %d failed: %v", res.kind, res.err)
+				a.fail(fmt.Sprintf("抓取失败: %v\n\nOK 重试，←/Back 返回缓存列表", res.err))
 			} else {
 				if err := cacheArticle(res.key, res.article); err != nil {
 					writeTrace("cache article %s: %v", res.key, err)
 				}
 				a.refreshCacheEntries()
-				a.openArticle(res.article, a.backView)
+				a.openArticle(res.article)
 			}
 		}
 		_ = platform.Draw(a.render(), false)
@@ -214,8 +212,6 @@ func (a *app) refreshCacheEntries() {
 func (a *app) handleEvent(ev c1device.Event) bool {
 	a.message = "" // 临时提示只存活到下一次按键（reader-lab 同款语义）
 	switch a.view {
-	case viewHome:
-		return a.handleHome(ev)
 	case viewCache:
 		return a.handleCache(ev)
 	case viewReader:
@@ -225,52 +221,16 @@ func (a *app) handleEvent(ev c1device.Event) bool {
 	case viewError:
 		switch ev.Key {
 		case c1device.KeyOK:
-			a.startFetch(a.retryKind, a.backView)
+			a.startFetch(a.retryKind)
 		case c1device.KeyLeft, c1device.KeyBack:
-			a.view = a.errReturn
-		}
-	case viewFetching:
-		// 抓取中：Back 取消（后台 goroutine 结果到来时按当前视图忽略处理）
-		if ev.Key == c1device.KeyBack {
-			a.fetchCancel = true
-			a.errReturn = a.backView
-			a.fail("已取消抓取\n\n←/Back 返回")
-		}
-	}
-	return false
-}
-
-// handleHome 首页按键：今日一读 / 随机一篇 / 缓存列表。
-func (a *app) handleHome(ev c1device.Event) bool {
-	n := homeItems
-	switch ev.Key {
-	case c1device.KeyUp:
-		if a.homeSel > 0 {
-			a.homeSel--
-			if a.homeSel < a.homeFirst {
-				a.homeFirst = a.homeSel
-			}
-		}
-	case c1device.KeyDown:
-		if a.homeSel < n-1 {
-			a.homeSel++
-			if a.homeSel >= a.homeFirst+listRows {
-				a.homeFirst = a.homeSel - listRows + 1
-			}
-		}
-	case c1device.KeyOK:
-		switch a.homeSel {
-		case 0:
-			a.openToday()
-		case 1:
-			a.startFetch(fetchRandom, viewHome)
-		case 2:
-			a.refreshCacheEntries()
-			a.cacheSel, a.cacheFirst = 0, 0
 			a.view = viewCache
 		}
-	case c1device.KeyBack:
-		return true
+	case viewFetching:
+		// 抓取中：Back 取消（后台 goroutine 结果到来时按 fetchCancel 丢弃）
+		if ev.Key == c1device.KeyBack {
+			a.fetchCancel = true
+			a.fail("已取消抓取\n\n←/Back 返回缓存列表")
+		}
 	}
 	return false
 }
@@ -279,12 +239,12 @@ func (a *app) handleHome(ev c1device.Event) bool {
 func (a *app) openToday() {
 	key := todayKey(time.Now())
 	if article, err := loadArticle(key); err == nil && article != nil {
-		a.openArticle(article, viewHome)
+		a.openArticle(article)
 		return
 	} else if err != nil {
 		writeTrace("load today cache %s: %v", key, err)
 	}
-	a.startFetch(fetchToday, viewHome)
+	a.startFetch(fetchToday)
 }
 
 // openCache 从缓存列表打开选中的文章。
@@ -295,16 +255,14 @@ func (a *app) openCache() {
 	key := a.cacheEntries[a.cacheSel].Key
 	article, err := loadArticle(key)
 	if err != nil || article == nil {
-		a.errReturn = viewCache
-		a.fail(fmt.Sprintf("读取缓存失败: %v\n\n←/Back 返回", err))
+		a.fail(fmt.Sprintf("读取缓存失败: %v\n\n←/Back 返回缓存列表", err))
 		return
 	}
-	a.openArticle(article, viewCache)
+	a.openArticle(article)
 }
 
-// startFetch 后台抓取（today/random）；back 为完成后阅读器 Back 的退回视图。
-func (a *app) startFetch(kind fetchKind, back viewMode) {
-	a.backView = back
+// startFetch 后台抓取（today/random）；完成后直接进入阅读器，Back 退回缓存列表。
+func (a *app) startFetch(kind fetchKind) {
 	a.fetchCancel = false
 	a.view = viewFetching
 	a.fetchDone = make(chan fetchResult, 1)
@@ -340,7 +298,7 @@ func (a *app) startFetch(kind fetchKind, back viewMode) {
 }
 
 // openArticle 打开文章并分页进入阅读器。
-func (a *app) openArticle(article *Article, back viewMode) {
+func (a *app) openArticle(article *Article) {
 	title := article.Title
 	if article.Author != "" {
 		title += "·" + article.Author
@@ -348,7 +306,7 @@ func (a *app) openArticle(article *Article, back viewMode) {
 	text := articleText(article)
 	pages, err := paginate(text, a.bodyFace, a.readerBodyHeight())
 	if err != nil {
-		a.fail(fmt.Sprintf("分页失败: %v\n\n←/Back 返回", err))
+		a.fail(fmt.Sprintf("分页失败: %v\n\n←/Back 返回缓存列表", err))
 		return
 	}
 	if len(pages) == 0 {
@@ -358,7 +316,6 @@ func (a *app) openArticle(article *Article, back viewMode) {
 	a.readerTitle = title
 	a.pages = pages
 	a.readerPage = 0
-	a.backView = back
 	a.view = viewReader
 }
 
@@ -371,7 +328,7 @@ func articleText(a *Article) string {
 	return text
 }
 
-// handleCache 缓存列表按键。
+// handleCache 缓存列表按键；Back 退出应用。
 func (a *app) handleCache(ev c1device.Event) bool {
 	n := len(a.cacheEntries)
 	switch ev.Key {
@@ -391,8 +348,8 @@ func (a *app) handleCache(ev c1device.Event) bool {
 		}
 	case c1device.KeyOK:
 		a.openCache()
-	case c1device.KeyLeft, c1device.KeyBack:
-		a.view = viewHome
+	case c1device.KeyBack:
+		return true
 	}
 	return false
 }
@@ -411,7 +368,7 @@ func (a *app) handleReader(ev c1device.Event) bool {
 	case c1device.KeyOK:
 		a.toggleFullscreen()
 	case c1device.KeyLeft, c1device.KeyBack:
-		a.view = a.backView
+		a.view = viewCache
 	case c1device.KeyRune:
 		switch ev.Rune {
 		case 's', 'S':
@@ -419,6 +376,8 @@ func (a *app) handleReader(ev c1device.Event) bool {
 			a.settingsSel = 0
 		case 'f', 'F':
 			a.toggleFullscreen()
+		case 'r', 'R':
+			a.startFetch(fetchRandom)
 		}
 	}
 	return false
